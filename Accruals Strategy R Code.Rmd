@@ -1,0 +1,164 @@
+---
+title: "Behavioral Finance Data Project"
+author: "Abdul Moiz"
+date: "November 27, 2019"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+library(data.table)
+library(lubridate)
+library(DescTools)
+library(ggplot2)
+```
+
+## Importing and Cleaning Data
+
+```{r}
+crsp=fread('crsp_all.txt')
+compustat=fread('compustat_all.txt')
+
+crsp[,date:=as.Date(parse_date_time(date,'ymd'))]
+crsp=crsp[SHRCD==10 | SHRCD==11, ]
+crsp=crsp[EXCHCD==1 | EXCHCD==2 | EXCHCD==3,]
+
+for (i in c('RET')){
+  crsp[get(i) %in% c('','A','B','C','P','S','T'),paste0(i):=NA]
+  crsp[,paste0(i):=as.numeric(get(i))]
+  crsp[get(i) %in% c(-66,-77,-88,-99),paste0(i):=NA]
+}
+
+crsp[,e_ret:=RET-sprtrn,]
+crsp[,month:=month(date)]
+crsp[,year:=year(date)]
+
+
+
+crsp_clean=crsp[,.(PERMNO,month,year,COMNAM,e_ret)]
+
+crsp_clean[,qtr:=ifelse(month %in% c(1,2,3),'Q1',ifelse(month %in% c(4,5,6),'Q2',ifelse(month %in% c(7,8,9),'Q3','Q4')))]
+crsp_clean[,datacqtr:=paste0(year,qtr)]
+crsp_clean=crsp_clean[,qtr:=NULL,]
+colnames(crsp_clean)[1]='LPERMNO'
+
+```
+
+
+## Creating Factor in Compustat
+
+```{r}
+setorder(compustat,LPERMNO,datacqtr)
+compustat[is.na(txpq),txpq:=0]
+
+compustat[,non_cash_ca:=actq-cheq]
+compustat[,change_non_cash_ca:=non_cash_ca-shift(non_cash_ca),by=LPERMNO]
+
+compustat[,cl_exclusive:=lctq-dlcq-txpq]
+compustat[,change_cl_exclusive:=cl_exclusive-shift(cl_exclusive),by=LPERMNO]
+
+compustat[,avg_ta:=(atq+shift(atq))/2,by=LPERMNO]
+
+compustat[,accrual:=(change_non_cash_ca-change_cl_exclusive-dpq)/avg_ta]
+
+compustat_clean=na.omit(compustat[,.(LPERMNO,datacqtr,accrual)])
+
+```
+
+## Mergin CRSP/Compustat, Quarterly Rebalancing (Fundamental Data), Shifting Accrual Factor one quarter ahead (Approx. 90 days) to avoid Lookahead Bias and Shiting Returns to get bin return for next 4 quarters 
+
+```{r}
+normalize=function(x){
+  x=(x-mean(x,na.rm = T))/sd(x,na.rm = T)
+  return(Winsorize(x,probs=c(0.001,0.999),na.rm = T))
+}
+
+accruals=merge(crsp_clean,compustat_clean,by=c('LPERMNO','datacqtr'),all.x=T)
+
+#Getting Quarterly Returns. Because of Fundamental Data, I rebalance quarterly
+accruals[,q_ret:=sum(e_ret),by=.(LPERMNO,datacqtr)]
+
+accruals_q=unique(accruals[,.(LPERMNO,datacqtr,COMNAM,accrual,q_ret)])
+
+#Leading accruals by a quarter to avoid Lookahead Bias
+setorder(accruals_q,LPERMNO,datacqtr)
+accruals_q[,accrual_lead:=shift(accrual,n=1),by=LPERMNO]
+
+#Getting Returns for next Year 
+accruals_q[,f_qret:=Reduce(`+`,shift(q_ret,n=1:4,type='lead'))/4,by=LPERMNO]
+
+#Winsorizing our Factor to adjust for outliers
+accruals_q[,accrual_lead_win:=normalize(accrual_lead),by=datacqtr]
+
+#Making Deciles for accruals
+accruals_q[,bins:=.bincode(accrual_lead_win,breaks = quantile(accrual_lead_win,probs=c(0:5)/5,na.rm = T),include.lowest = T),by=datacqtr]
+
+#Getting Returns for each decile
+accruals_q[,c_ret:=mean(f_qret,na.rm = T),by=.(datacqtr,bins)]
+
+
+```
+
+## Portfolio Returns (All returns are in excess of S&P 500)
+
+```{r}
+portfolio=na.omit(unique(accruals_q[,.(datacqtr,bins,c_ret)]))
+setorder(portfolio,datacqtr,bins)
+
+portfolio_bins=dcast.data.table(portfolio[c_ret!=0,],datacqtr~bins,value.var = 'c_ret')
+
+#Accrual Long Short (Lowest Decile - Highest Decile)
+
+portfolio_bins[,LS:=`1`-`5`]
+
+portfolio_bins_melt=melt.data.table(portfolio_bins,id.vars='datacqtr')
+colnames(portfolio_bins_melt)[2]='Bins'
+
+```
+
+## Summary Statistics
+
+```{r}
+stats=data.frame(matrix(0,nrow=4,ncol=6))
+rownames(stats)=c('Mean','Median','Std. Dev ','Sharpe Ratio')
+colnames(stats)=colnames(portfolio_bins[,2:7])
+
+stats[1,]=apply(portfolio_bins[,2:7],2,function(x) mean(x,na.rm=T))*4*100
+stats[2,]=apply(portfolio_bins[,2:7],2,function(x) median(x,na.rm=T))*4*100
+stats[3,]=apply(portfolio_bins[,2:7],2,function(x) sd(x,na.rm=T))*sqrt(4)*100
+stats[4,]=stats[1,]/stats[3,]
+
+
+stats
+```
+
+## Graphs and Cumulative Returns
+
+```{r}
+stats_melt=melt(stats[1,])
+ggplot(stats_melt,aes(x=variable,y=value))+geom_bar(stat='identity')+ylab('Mean Returns (%)')+xlab('Bin')
+
+portfolio_LS=portfolio_bins_melt[Bins=='LS',.(datacqtr,Bins,value)]
+portfolio_LS[,date:=year(as.Date(parse_date_time(substr(datacqtr,1,4),'y')))]
+portfolio_LS[,cumvalue:=sum(value,na.rm = T),by=date]
+portfolio_LS_years=unique(portfolio_LS[,.(date,cumvalue)])
+
+ggplot(portfolio_LS_years,aes(x=date,y=cumvalue*100))+geom_bar(stat='identity')+xlab('Year')+ylab('Annual Return (LS) %')
+
+portfolio_bins_melt=na.omit(portfolio_bins_melt)
+portfolio_bins_melt[,cumret:=cumsum(value),by=Bins]
+
+#Cumulative Returns of all Bins
+
+portfolio_bins_melt[,qtr:=1:.N,by=Bins]
+
+ggplot(portfolio_bins_melt,aes(x=qtr,y=cumret*100,group=Bins))+geom_line(aes(col=Bins))+ylab('Cumulative Returns (%)')+xlab('Quarter (1973-2018)')
+
+
+```
+
+
+
+
